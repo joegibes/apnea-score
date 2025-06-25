@@ -1,5 +1,31 @@
 import pandas as pd
 from typing import Optional, List
+import mne
+import numpy as np
+
+def load_edf_data(filepath: str) -> Optional[pd.DataFrame]:
+    """
+    Loads CPAP data from an EDF file into a pandas DataFrame.
+
+    Args:
+        filepath (str): Path to the EDF file.
+
+    Returns:
+        Optional[pd.DataFrame]: DataFrame with data from the EDF file,
+                                 or None if loading fails.
+    """
+    try:
+        raw = mne.io.read_raw_edf(filepath, preload=True, verbose=False)
+        df = raw.to_data_frame()
+        # Timestamps are not always in a 'timestamp' column, they are often the index
+        if 'time' in df.columns:
+             df['timestamp'] = pd.to_datetime(raw.info['meas_date']) + pd.to_timedelta(df['time'], unit='s')
+             df = df.set_index('timestamp')
+             df = df.drop(columns=['time'])
+        return df
+    except Exception as e:
+        print(f"Error loading EDF file {filepath}: {e}")
+        return None
 
 def load_cpap_data(filepath: str,
                    timestamp_col: str = 'timestamp',
@@ -141,7 +167,7 @@ def resample_data(df: pd.DataFrame, target_freq_hz: int = 25) -> Optional[pd.Dat
         print("Warning: DataFrame is empty, cannot resample.")
         return df
 
-    rule = f"{1000/target_freq_hz:.0f}L" # Resample rule in milliseconds (L)
+    rule = f"{1000/target_freq_hz:.0f}ms" # Resample rule in milliseconds
 
     try:
         # Separate numeric and non-numeric columns if any non-numeric exist besides index
@@ -171,157 +197,4 @@ def resample_data(df: pd.DataFrame, target_freq_hz: int = 25) -> Optional[pd.Dat
         return None
 
 if __name__ == '__main__':
-    # Create a dummy CSV for testing
-    dummy_data = {
-        'Time': pd.to_datetime(['2023-01-01 00:00:00.000',
-                                '2023-01-01 00:00:00.040',
-                                '2023-01-01 00:00:00.080',
-                                '2023-01-01 00:00:00.120',
-                                '2023-01-01 00:00:00.200']), # Note: uneven sampling for test
-        'Flow (L/min)': [0.1, 0.5, 0.2, -0.3, 0.1],
-        'Pressure (cmH2O)': [5.0, 5.1, 5.0, 4.9, 5.0],
-        'Leak (L/min)': [0.0, 0.1, 0.0, 0.2, 0.1],
-        'Events': ['None', 'None', 'Hypopnea', 'None', 'Apnea'] # Example of a non-numeric column
-    }
-    dummy_df = pd.DataFrame(dummy_data)
-    dummy_csv_path = 'data/dummy_cpap_data.csv'
-    dummy_df.to_csv(dummy_csv_path, index=False)
-
-    print(f"Created dummy CSV at {dummy_csv_path}")
-
-    # Test loading
-    print("\n--- Testing data loading ---")
-    loaded_df = load_cpap_data(dummy_csv_path,
-                               timestamp_col='Time',
-                               flow_rate_col='Flow (L/min)',
-                               pressure_col='Pressure (cmH2O)',
-                               leak_rate_col='Leak (L/min)')
-
-    if loaded_df is not None:
-        print("Successfully loaded data:")
-        print(loaded_df.head())
-        print("\nData types:")
-        print(loaded_df.dtypes)
-
-        # Test resampling
-        print("\n--- Testing resampling to 10 Hz ---")
-        resampled_df_10hz = resample_data(loaded_df.copy(), target_freq_hz=10) # Target 100ms interval
-        if resampled_df_10hz is not None:
-            print("Resampled data (10 Hz):")
-            print(resampled_df_10hz)
-            print(f"Number of rows: {len(resampled_df_10hz)}")
-
-        print("\n--- Testing resampling to 25 Hz (Original was effectively 25Hz for first few points) ---")
-        # Original data is 40ms interval = 25Hz
-        resampled_df_25hz = resample_data(loaded_df.copy(), target_freq_hz=25)
-        if resampled_df_25hz is not None:
-            print("Resampled data (25 Hz):")
-            print(resampled_df_25hz)
-            print(f"Number of rows: {len(resampled_df_25hz)}")
-
-        print("\n--- Testing resampling to 50 Hz (Upsampling) ---")
-        resampled_df_50hz = resample_data(loaded_df.copy(), target_freq_hz=50)
-        if resampled_df_50hz is not None:
-            print("Resampled data (50 Hz):")
-            print(resampled_df_50hz)
-            print(f"Number of rows: {len(resampled_df_50hz)}")
-
-    else:
-        print("Data loading failed.")
-
-    # Test with missing essential column
-    print("\n--- Testing with missing essential column ---")
-    missing_col_map = {
-        'timestamp': 'Time',
-        'flow_rate': 'NonExistentFlowCol', # This column doesn't exist
-        'pressure': 'Pressure (cmH2O)',
-        'leak_rate': 'Leak (L/min)'
-    }
-    # Need to save a df that would cause this
-    temp_df_missing = dummy_df.rename(columns={'Flow (L/min)': 'Actual Flow'})
-    temp_df_missing.to_csv('data/dummy_missing_col.csv', index=False)
-
-    loaded_missing_df = load_cpap_data('data/dummy_missing_col.csv',
-                                       timestamp_col='Time',
-                                       flow_rate_col='NonExistentFlowCol', # Standard name we expect
-                                       pressure_col='Pressure (cmH2O)',
-                                       leak_rate_col='Leak (L/min)')
-    if loaded_missing_df is None:
-        print("Correctly failed to load due to missing mapped essential column.")
-
-    print("\n--- Testing with custom column map ---")
-    custom_map = {
-        'flow_rate': 'Flow (L/min)', # map standard 'flow_rate' to actual 'Flow (L/min)'
-        'pressure': 'Pressure (cmH2O)',
-        'leak_rate': 'Leak (L/min)'
-    }
-    # Here, we rely on the default timestamp_col='timestamp', but our file has 'Time'
-    # So, we need to provide timestamp_col explicitly or add it to custom_col_map
-    loaded_custom_df = load_cpap_data(dummy_csv_path,
-                                      timestamp_col='Time', # Explicitly state the actual timestamp column name
-                                      custom_col_map=custom_map) # Provide map for others
-
-    if loaded_custom_df is not None:
-        print("Successfully loaded data using custom map:")
-        print(loaded_custom_df.head())
-    else:
-        print("Custom map loading failed.")
-
-    print("\n--- Testing with completely different column names and custom_col_map ---")
-    df_alt_names = pd.DataFrame({
-        'MyTime': pd.to_datetime(['2023-01-01 00:00:00', '2023-01-01 00:00:01']),
-        'AirFlow': [0.2, 0.3],
-        'AirPressure': [6, 6.1],
-        'MaskLeak': [0.1, 0.1]
-    })
-    alt_csv_path = 'data/dummy_alt_names.csv'
-    df_alt_names.to_csv(alt_csv_path, index=False)
-
-    loaded_alt_df = load_cpap_data(alt_csv_path,
-                                   custom_col_map={
-                                       'timestamp': 'MyTime',
-                                       'flow_rate': 'AirFlow',
-                                       'pressure': 'AirPressure',
-                                       'leak_rate': 'MaskLeak'
-                                   })
-    if loaded_alt_df is not None:
-        print("Successfully loaded data with alternative names via custom_col_map:")
-        print(loaded_alt_df.head())
-    else:
-        print("Loading with alternative names and custom_col_map failed.")
-
-    print("\n--- Testing data loading with specified optional columns ---")
-    dummy_data_full = {
-        'Time': pd.to_datetime(['2023-01-01 00:00:00.000', '2023-01-01 00:00:00.040']),
-        'Flow': [0.1, 0.5],
-        'Press': [5.0, 5.1],
-        'Lek': [0.0, 0.1],
-        'MV': [5.0, 5.2],
-        'RR': [12, 13],
-        'TV': [0.4, 0.45]
-    }
-    dummy_df_full = pd.DataFrame(dummy_data_full)
-    dummy_full_csv_path = 'data/dummy_cpap_data_full.csv'
-    dummy_df_full.to_csv(dummy_full_csv_path, index=False)
-
-    loaded_df_full = load_cpap_data(dummy_full_csv_path,
-                               timestamp_col='Time',
-                               flow_rate_col='Flow',
-                               pressure_col='Press',
-                               leak_rate_col='Lek',
-                               minute_vent_col='MV',
-                               resp_rate_col='RR',
-                               tidal_vol_col='TV')
-
-    if loaded_df_full is not None:
-        print("Successfully loaded data with all optional columns specified:")
-        print(loaded_df_full.head())
-        expected_cols = ['flow_rate', 'pressure', 'leak_rate', 'minute_ventilation', 'respiratory_rate', 'tidal_volume']
-        missing_in_df = [col for col in expected_cols if col not in loaded_df_full.columns]
-        if not missing_in_df:
-            print(f"All expected columns present: {loaded_df_full.columns.tolist()}")
-        else:
-            print(f"Error: Missing expected columns after load: {missing_in_df}")
-    else:
-        print("Full data loading failed.")
-import numpy as np # Add numpy import for the script
+    pass
