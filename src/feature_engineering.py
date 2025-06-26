@@ -200,20 +200,24 @@ def extract_features_for_event(
     event_row: pd.Series,
     flow_series: pd.Series,
     pressure_series: pd.Series,
-    # breath_df: Optional[pd.DataFrame], # If using breath-by-breath features
+    breaths_df: Optional[pd.DataFrame], # DataFrame of detected breaths
+    flow_limitation_series: Optional[pd.Series], # Full flow limitation signal from device
     sampling_freq_hz: float,
     pre_event_window_s: int = 30,
     post_event_window_s: int = 30
 ) -> dict:
     """
-    Extracts a feature vector for a single respiratory event.
+    Extracts a feature vector for a single respiratory event, including flow limitation.
 
     Args:
-        event_row (pd.Series): A row from the event DataFrame (from event_detection.py).
+        event_row (pd.Series): A row from the event DataFrame.
                                Must contain 'event_start_time', 'event_end_time', 'event_type'.
-        flow_series (pd.Series): Full flow rate signal.
-        pressure_series (pd.Series): Full pressure signal.
-        # breath_df (Optional[pd.DataFrame]): DataFrame of detected breaths.
+        flow_series (pd.Series): Full flow rate signal (filtered).
+        pressure_series (pd.Series): Full pressure signal (filtered).
+        breaths_df (Optional[pd.DataFrame]): DataFrame of detected breaths from `detect_breaths_from_flow`.
+                                           Required for per-breath IFL features.
+        flow_limitation_series (Optional[pd.Series]): Full device-reported flow limitation signal,
+                                                      time-aligned with flow_series.
         sampling_freq_hz (float): Sampling frequency.
         pre_event_window_s (int): Window size for pre-event features.
         post_event_window_s (int): Window size for post-event features.
@@ -304,6 +308,7 @@ def extract_features_for_event(
 
     # Ensure all expected feature keys are present, filling with NaN if calculation failed
     # This list should be maintained based on features defined.
+    # Ensure new flow limitation features are added to expected_feature_keys if they have fixed names
     expected_feature_prefixes = [
         'flow_pre', 'flow_during', 'flow_post',
         'pressure_pre', 'pressure_during', 'pressure_post'
@@ -328,7 +333,217 @@ def extract_features_for_event(
         if key not in features:
             features[key] = np.nan
 
+    # Placeholder for IFL features that will be aggregated at event level by the caller
+    # These are calculated per-breath, then aggregated by extract_features_for_event.
+    # Example keys that might be created by aggregation:
+    # 'event_avg_ifl_area_ratio', 'event_max_ifl_poly_a',
+    # 'event_avg_device_ifl_mean', 'event_max_device_ifl_percent_active'
+    # No need to add them here as this function is for a single event's non-breath specific features,
+    # or features for the overall event segment (like flow_during_...).
+    # The IFL features will be added by the calling function after processing breaths.
+
+    # --- Inspiratory Flow Limitation (IFL) Features (from breaths during event) ---
+    ifl_feature_names = [ # From calculate_flow_limitation_features
+        'ifl_shape_area_ratio', 'ifl_shape_mid_point_flow',
+        'ifl_shape_peak_broadness', 'ifl_poly_coeff_a',
+        'ifl_poly_coeff_b', 'ifl_poly_coeff_c',
+        'device_ifl_mean', 'device_ifl_max',
+        'device_ifl_median', 'device_ifl_percent_high'
+    ]
+    # Initialize aggregated IFL features with NaN
+    for feat_name in ifl_feature_names:
+        features[f'event_mean_{feat_name}'] = np.nan
+        features[f'event_max_{feat_name}'] = np.nan # Max for severity, min for poly_a might be interesting
+        features[f'event_min_{feat_name}'] = np.nan # Min for severity (e.g. min area ratio if paradoxical)
+        features[f'event_std_{feat_name}'] = np.nan
+
+    if breaths_df is not None and not breaths_df.empty:
+        # Select breaths that occur *during* the event
+        # A breath is "during" if its midpoint falls within the event, or significant overlap.
+        # For simplicity: breath_start_time < event_end and breath_end_time > event_start
+        event_breaths = breaths_df[
+            (breaths_df['breath_start_time'] < event_end) &
+            (breaths_df['breath_end_time'] > event_start)
+        ].copy() # Use .copy() to avoid SettingWithCopyWarning on later modifications
+
+        per_breath_ifl_features_list = []
+        if not event_breaths.empty:
+            for _, breath_row in event_breaths.iterrows():
+                insp_start_time = breath_row['breath_start_time']
+                # insp_end_time is breath_mid_time (end of inspiration)
+                insp_end_time = breath_row['breath_mid_time']
+
+                if insp_end_time <= insp_start_time: # Skip invalid breath segments
+                    continue
+
+                current_insp_flow_segment = flow_series.loc[insp_start_time:insp_end_time]
+
+                current_device_ifl_segment = None
+                if flow_limitation_series is not None and not flow_limitation_series.empty:
+                    # Ensure series are aligned; loc should handle it if indices are compatible
+                    try:
+                        current_device_ifl_segment = flow_limitation_series.loc[insp_start_time:insp_end_time]
+                        if current_device_ifl_segment.empty: current_device_ifl_segment = None
+                    except KeyError: # Handle cases where segment might be out of bounds for flow_limitation_series
+                        current_device_ifl_segment = None
+
+                if not current_insp_flow_segment.empty:
+                    single_breath_ifl = calculate_flow_limitation_features(
+                        current_insp_flow_segment,
+                        sampling_freq_hz,
+                        device_flow_lim_segment=current_device_ifl_segment
+                    )
+                    per_breath_ifl_features_list.append(single_breath_ifl)
+
+            if per_breath_ifl_features_list:
+                per_breath_ifl_df = pd.DataFrame(per_breath_ifl_features_list)
+                for feat_name in ifl_feature_names:
+                    if feat_name in per_breath_ifl_df.columns and per_breath_ifl_df[feat_name].notna().any():
+                        features[f'event_mean_{feat_name}'] = per_breath_ifl_df[feat_name].mean(skipna=True)
+                        features[f'event_std_{feat_name}'] = per_breath_ifl_df[feat_name].std(skipna=True)
+                        if feat_name == 'ifl_poly_coeff_a': # For 'a' (curvature), more negative is more peaked. Max abs might be useful, or min value.
+                            features[f'event_min_{feat_name}'] = per_breath_ifl_df[feat_name].min(skipna=True) # Most negative 'a'
+                            features[f'event_max_{feat_name}'] = per_breath_ifl_df[feat_name].max(skipna=True) # Least negative 'a' (flat)
+                        else: # For most IFL indices, higher value means more limitation/flatter
+                            features[f'event_max_{feat_name}'] = per_breath_ifl_df[feat_name].max(skipna=True)
+                            features[f'event_min_{feat_name}'] = per_breath_ifl_df[feat_name].min(skipna=True)
+
+
+    # Final check for any other expected keys that might have been missed if they were not part of prefixes
+    # This is important if new features are added outside the loop structures.
+    all_defined_keys = list(features.keys()) # Get all keys currently in features
+    for key_template_list in [other_expected_keys]: # Add more lists if needed
+        for key in key_template_list:
+            if key not in all_defined_keys and f'event_mean_{key}' not in all_defined_keys : # Check if not already defined or aggregated
+                features[key] = np.nan # Ensure it exists
+
     return features
+
+
+def calculate_flow_limitation_features(
+    insp_flow_segment: pd.Series,
+    sampling_freq_hz: float,
+    device_flow_lim_segment: Optional[pd.Series] = None
+) -> Dict[str, float]:
+    """
+    Calculates features to quantify inspiratory flow limitation for a single inspiration.
+
+    Args:
+        insp_flow_segment (pd.Series): Flow rate data for one inspiratory phase.
+                                     Index must be DatetimeIndex. Values should be positive.
+        sampling_freq_hz (float): Sampling frequency of the flow signal.
+        device_flow_lim_segment (Optional[pd.Series]): Corresponding segment of the device's
+                                                       flow limitation signal (e.g., FlowLim.2s).
+                                                       Must be time-aligned with insp_flow_segment.
+
+    Returns:
+        Dict[str, float]: A dictionary of calculated flow limitation features.
+                          Keys might include: 'ifl_shape_area_ratio', 'ifl_shape_mid_point_flow',
+                          'ifl_shape_peak_broadness', 'ifl_poly_coeff_a', 'ifl_poly_coeff_b',
+                          'ifl_poly_coeff_c', 'device_ifl_mean', 'device_ifl_max',
+                          'device_ifl_percent_high' (if device signal is binary-like).
+    """
+    features = {}
+    default_nan_ifl_features = {
+        'ifl_shape_area_ratio': np.nan, 'ifl_shape_mid_point_flow': np.nan,
+        'ifl_shape_peak_broadness': np.nan, 'ifl_poly_coeff_a': np.nan,
+        'ifl_poly_coeff_b': np.nan, 'ifl_poly_coeff_c': np.nan,
+        'device_ifl_mean': np.nan, 'device_ifl_max': np.nan,
+        'device_ifl_median': np.nan, 'device_ifl_percent_high': np.nan
+    }
+
+    if insp_flow_segment is None or len(insp_flow_segment) < max(5, int(0.1 * sampling_freq_hz)) : # Need min points for robust analysis
+        return default_nan_ifl_features
+
+    # Ensure flow is positive for inspiratory specific calculations
+    insp_flow_positive = insp_flow_segment.clip(lower=0)
+    if insp_flow_positive.max() <= 1e-6: # Effectively no inspiratory flow
+        return default_nan_ifl_features
+
+    # 1. Normalization
+    # Time normalization (0 to 1)
+    insp_duration_s = (insp_flow_positive.index[-1] - insp_flow_positive.index[0]).total_seconds()
+    if insp_duration_s < 0.1: # Inspirations too short are unreliable for shape analysis
+        return default_nan_ifl_features
+
+    time_normalized = np.linspace(0, 1, len(insp_flow_positive))
+
+    # Amplitude normalization (0 to 1)
+    min_flow = insp_flow_positive.min() # Should be close to 0 for insp phase start/end
+    peak_flow = insp_flow_positive.max()
+
+    if (peak_flow - min_flow) < 1e-6: # Flat or zero flow, avoid division by zero
+        # If flat and positive, it's maximally limited.
+        # Area ratio would be 1. Mid-point flow 1. Poly 'a' near 0.
+        features['ifl_shape_area_ratio'] = 1.0 if peak_flow > 1e-6 else np.nan
+        features['ifl_shape_mid_point_flow'] = 1.0 if peak_flow > 1e-6 else np.nan
+        features['ifl_shape_peak_broadness'] = 1.0 if peak_flow > 1e-6 else np.nan # Max broadness
+        features['ifl_poly_coeff_a'] = 0.0
+        features['ifl_poly_coeff_b'] = 0.0
+        features['ifl_poly_coeff_c'] = 1.0 if peak_flow > 1e-6 else np.nan
+    else:
+        flow_amplitude_normalized = (insp_flow_positive - min_flow) / (peak_flow - min_flow)
+
+        # 2.A. Flattening Index 1 (Area-based / Mean of normalized flow)
+        features['ifl_shape_area_ratio'] = np.mean(flow_amplitude_normalized)
+
+        # 2.B. Flattening Index 2 (Mid-point based)
+        # Interpolate to find flow at exact normalized time points 0.25, 0.5, 0.75
+        try:
+            flow_at_0_25_norm_time = np.interp(0.25, time_normalized, flow_amplitude_normalized)
+            flow_at_0_50_norm_time = np.interp(0.50, time_normalized, flow_amplitude_normalized)
+            flow_at_0_75_norm_time = np.interp(0.75, time_normalized, flow_amplitude_normalized)
+            features['ifl_shape_mid_point_flow'] = flow_at_0_50_norm_time
+            features['ifl_shape_peak_broadness'] = (flow_at_0_25_norm_time + flow_at_0_75_norm_time) / 2.0
+        except Exception: # Should not happen with linspace and interp on simple arrays
+            features['ifl_shape_mid_point_flow'] = np.nan
+            features['ifl_shape_peak_broadness'] = np.nan
+
+
+        # 2.C. Polynomial Fit Coefficients (Quadratic)
+        try:
+            if len(time_normalized) >= 3: # Need at least 3 points for quadratic fit
+                coeffs = np.polyfit(time_normalized, flow_amplitude_normalized, 2)
+                features['ifl_poly_coeff_a'] = coeffs[0] # ax^2
+                features['ifl_poly_coeff_b'] = coeffs[1] # bx
+                features['ifl_poly_coeff_c'] = coeffs[2] # c
+            else:
+                features['ifl_poly_coeff_a'] = np.nan
+                features['ifl_poly_coeff_b'] = np.nan
+                features['ifl_poly_coeff_c'] = np.nan
+        except (np.linalg.LinAlgError, ValueError): # Catch potential errors in polyfit
+            features['ifl_poly_coeff_a'] = np.nan
+            features['ifl_poly_coeff_b'] = np.nan
+            features['ifl_poly_coeff_c'] = np.nan
+
+    # 3. Process Device `flow_limitation` Signal
+    if device_flow_lim_segment is not None and not device_flow_lim_segment.empty:
+        features['device_ifl_mean'] = device_flow_lim_segment.mean()
+        features['device_ifl_max'] = device_flow_lim_segment.max()
+        features['device_ifl_median'] = device_flow_lim_segment.median()
+        # If device_flow_lim is binary-like (0s and 1s, or specific scores like ResMed's 0-0.4)
+        # This threshold for "high" might need tuning based on device's output scale/meaning
+        # For ResMed, FlowLim is 0 (no limit) to 0.4 (severe limit).
+        # Let's assume > 0.1 indicates some limitation for this example.
+        device_ifl_high_threshold = 0.1
+        if device_flow_lim_segment.max() > 0: # Only calculate if there's some signal
+             features['device_ifl_percent_high'] = \
+                (device_flow_lim_segment > device_ifl_high_threshold).mean() * 100
+        else:
+             features['device_ifl_percent_high'] = 0.0
+    else:
+        features['device_ifl_mean'] = np.nan
+        features['device_ifl_max'] = np.nan
+        features['device_ifl_median'] = np.nan
+        features['device_ifl_percent_high'] = np.nan
+
+    # Fill any missing features with NaN (if some calculation failed internally but didn't return early)
+    for key in default_nan_ifl_features:
+        if key not in features:
+            features[key] = np.nan
+
+    return features
+
 
 if __name__ == '__main__':
     # Setup for testing - requires data similar to event_detection output
