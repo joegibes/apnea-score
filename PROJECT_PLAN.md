@@ -35,7 +35,7 @@ This will be implemented in `src/feature_engineering.py`.
 -   [ ] **SpO2 Feature:**
     -   `Type of Desaturation`: Analyze the shape and timing of SpO2 dips relative to breath events to classify them as symmetric (likely central) or asymmetric (likely obstructive).
 -   [ ] **Proxy Effort Feature (Pressure-Based):**
-    -   Analyze the `Press.40ms` signal.
+    -   Analyze the `Press.40ms` signal. #user note: No, this is the raw pressure. Focus on the flow, mask pressure, etc as better data... I'm not sure how this raw pressure translates to "effort". Also note that this Resmed Airsense 11 uses "Forced Oscillation Technique" to detect clear airway events during apnea - 4s after apnea start is detected, it oscillates 1cmh2O at 4hz (idk) and can somehow tell based on the reflections (pressure signal?). However, IMO this isn't very helpful for our purposes, since we're rating each BREATH, not merely apnea events.
     -   For each breath, calculate the change in pressure during the inspiratory phase.
     -   Hypothesis: A significant *increase* in pressure during a flow-limited breath is a strong proxy for "effort."
 
