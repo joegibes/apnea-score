@@ -10,6 +10,22 @@ The Parekh et al. paper uses five signals: airflow, thoracic effort, abdominal e
 
 **User Instruction (2025-06-25):** Ignore `_SA2` (SpO2/Pulse) files, as the oximeter sensor is not in use. Focus only on signals that are actually present.
 
+**User Instruction (2025-06-26):** For all future data processing, only the BRP and PLD EDF files are relevant. For BRP, the primary signal of interest is 'Flow' (specifically 'Flow.40ms'). For PLD, 'mask pressure' (MaskPress.2s) and 'pressure' (Press.2s, aka set pressure) are the most useful. Other EDF files and signals can be disregarded unless otherwise specified.
+
+## Data Import, Processing, and Storage: Best Practices (2025-06-26)
+
+- **Import:**
+  - Use the `load_edf_data` function in `src/data_loader.py` to load EDF files into pandas DataFrames.
+  - Only load the relevant BRP and PLD files for each session (ignore other file types).
+  - For BRP, extract the 'Flow.40ms' signal. For PLD, extract 'MaskPress.2s' and 'Press.2s'.
+- **Processing:**
+  - Clean PLD data by removing checksum columns (columns containing 'Crc').
+  - Merge BRP and PLD DataFrames on their timestamp index using an outer join, then forward-fill and drop any remaining NaNs.
+  - Ensure all signals are time-aligned and indexed by timestamp.
+- **Storage:**
+  - Store merged session DataFrames in a standardized format (e.g., Parquet or HDF5) for efficient future access and analysis.
+  - Only retain the columns/signals of interest to minimize storage and processing overhead.
+
 Our strategy is to overcome this limitation by:
 1.  **Implementing Directly Possible Features:** We will implement the features from the paper that can be derived from airflow and SpO2.
 2.  **Developing Proxy Features:** We will create intelligent proxy features for the missing signals. For example, we can analyze changes in the **mask pressure signal** as a surrogate for respiratory effort. An increasing pressure against a limited flow is a strong indicator of an obstructive event.
