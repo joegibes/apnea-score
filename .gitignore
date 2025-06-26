@@ -196,3 +196,4 @@ cython_debug/
 
 # .edf files (sleep apnea data)
 .edf
+.parquet

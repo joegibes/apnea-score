@@ -1,8 +1,8 @@
 import pandas as pd
 from src.breath_detection import detect_breaths_from_flow
 
-# Load merged session data
-merged_path = 'data/2025/20250617_023551_merged.parquet'
+# Load trimmed 10-minute session data
+merged_path = 'data/2025/20250617_023551_merged_10min.parquet'
 df = pd.read_parquet(merged_path)
 
 # Run breath detection on Flow.40ms
