@@ -223,7 +223,10 @@ def extract_features_for_event(
         post_event_window_s (int): Window size for post-event features.
 
     Returns:
-        dict: A dictionary of extracted features for the event.
+        dict: A dictionary of extracted features for the event. Includes segment statistics,
+              aggregated per-breath flow limitation features (e.g., 'event_mean_ifl_shape_area_ratio'),
+              aggregated per-breath timing features (e.g., 'event_mean_prolonged_insp_ratio'),
+              and periodic breathing features (e.g., 'event_pb_rel_power').
     """
     features = {
         'event_id': event_row.name, # Assuming event_row is a row from a DataFrame with an index
@@ -342,7 +345,50 @@ def extract_features_for_event(
     # or features for the overall event segment (like flow_during_...).
     # The IFL features will be added by the calling function after processing breaths.
 
+    # --- Breath Timing Features (Prolonged Inspiration, I:E, RR) ---
+    # These features are calculated per-breath by `calculate_breath_timing_features`
+    # and should already be present in `breaths_df` if it's pre-processed.
+    # Here, we aggregate them for the event.
+    timing_feature_names = ['prolonged_insp_ratio', 'ie_ratio', 'respiratory_rate_bpm']
+    for feat_name in timing_feature_names:
+        features[f'event_mean_{feat_name}'] = np.nan
+        features[f'event_median_{feat_name}'] = np.nan # Median might be more robust for ratios
+        features[f'event_std_{feat_name}'] = np.nan
+        if feat_name == 'prolonged_insp_ratio':
+            features['event_max_prolonged_insp_ratio'] = np.nan
+            features['event_count_sig_prolonged_insp'] = 0 # Count breaths with ratio > 1.5 (example)
+
+    event_breaths_for_timing = pd.DataFrame() # Ensure it's defined
+
+    if breaths_df is not None and not breaths_df.empty:
+        # Ensure timing features are present in breaths_df, calculate if not
+        if 'prolonged_insp_ratio' not in breaths_df.columns:
+            print("Warning: Timing features (e.g. prolonged_insp_ratio) not found in breaths_df. Calculating them now.")
+            # This assumes standard column names like 'insp_duration_s' exist in breaths_df
+            if all(c in breaths_df.columns for c in ['insp_duration_s', 'exp_duration_s', 'total_duration_s']):
+                breaths_df = calculate_breath_timing_features(breaths_df)
+            else:
+                print("Error: Cannot calculate timing features due to missing duration columns in breaths_df.")
+
+        # Select breaths that occur *during* the event (same as for IFL)
+        event_breaths_for_timing = breaths_df[
+            (breaths_df['breath_start_time'] < event_end) &
+            (breaths_df['breath_end_time'] > event_start)
+        ].copy()
+
+        if not event_breaths_for_timing.empty:
+            for feat_name in timing_feature_names:
+                if feat_name in event_breaths_for_timing.columns and event_breaths_for_timing[feat_name].notna().any():
+                    features[f'event_mean_{feat_name}'] = event_breaths_for_timing[feat_name].mean(skipna=True)
+                    features[f'event_median_{feat_name}'] = event_breaths_for_timing[feat_name].median(skipna=True)
+                    features[f'event_std_{feat_name}'] = event_breaths_for_timing[feat_name].std(skipna=True)
+                    if feat_name == 'prolonged_insp_ratio':
+                        features['event_max_prolonged_insp_ratio'] = event_breaths_for_timing[feat_name].max(skipna=True)
+                        features['event_count_sig_prolonged_insp'] = (event_breaths_for_timing[feat_name] > 1.5).sum()
+
+
     # --- Inspiratory Flow Limitation (IFL) Features (from breaths during event) ---
+    # Uses event_breaths_for_timing which is same as event_breaths for IFL
     ifl_feature_names = [ # From calculate_flow_limitation_features
         'ifl_shape_area_ratio', 'ifl_shape_mid_point_flow',
         'ifl_shape_peak_broadness', 'ifl_poly_coeff_a',
@@ -412,10 +458,39 @@ def extract_features_for_event(
     # Final check for any other expected keys that might have been missed if they were not part of prefixes
     # This is important if new features are added outside the loop structures.
     all_defined_keys = list(features.keys()) # Get all keys currently in features
-    for key_template_list in [other_expected_keys]: # Add more lists if needed
-        for key in key_template_list:
-            if key not in all_defined_keys and f'event_mean_{key}' not in all_defined_keys : # Check if not already defined or aggregated
-                features[key] = np.nan # Ensure it exists
+    # Add new IFL and timing aggregate feature names to a list of expected keys if they are not covered by prefixes
+    aggregated_ifl_and_timing_prefixes = ['event_mean_', 'event_median_', 'event_std_', 'event_max_', 'event_min_', 'event_count_']
+
+    # Check other_expected_keys (non-aggregated, non-segment-stats)
+    for key in other_expected_keys:
+        is_aggregated_version_present = any(key.endswith(agg_key[len('event_'):]) and key.startswith(tuple(agg_pfx for agg_pfx in aggregated_ifl_and_timing_prefixes)) for agg_key in all_defined_keys)
+        if key not in all_defined_keys and not is_aggregated_version_present and f'event_mean_{key}' not in all_defined_keys:
+            features[key] = np.nan
+
+    # --- Periodic Breathing Features (calculated on a window around the event) ---
+    pb_feature_names = ['pb_abs_power', 'pb_rel_power', 'pb_peak_freq']
+    for feat_name in pb_feature_names:
+        features[f'event_{feat_name}'] = np.nan # Initialize
+
+    if breaths_df is not None and not breaths_df.empty and 'tidal_volume_l' in breaths_df.columns:
+        # Define window for PB analysis around the event (e.g., 120s before to 60s after event midpoint)
+        event_midpoint = event_start + (event_end - event_start) / 2
+        pb_window_start = event_midpoint - pd.Timedelta(seconds=120)
+        pb_window_end = event_midpoint + pd.Timedelta(seconds=60)
+
+        pb_analysis_breaths = breaths_df[
+            (breaths_df['breath_start_time'] >= pb_window_start) &
+            (breaths_df['breath_start_time'] < pb_window_end)
+        ]
+
+        if not pb_analysis_breaths.empty and len(pb_analysis_breaths) > 10: # Need enough breaths for PB analysis
+            # Use tidal_volume_l for amplitude, ensure it's indexed by breath_start_time
+            amplitudes_for_pb = pb_analysis_breaths.set_index('breath_start_time')['tidal_volume_l'].dropna()
+
+            if not amplitudes_for_pb.empty:
+                pb_features = calculate_periodic_breathing_features(amplitudes_for_pb)
+                for feat_name, val in pb_features.items():
+                    features[f'event_{feat_name}'] = val
 
     return features
 
@@ -543,6 +618,207 @@ def calculate_flow_limitation_features(
             features[key] = np.nan
 
     return features
+
+
+def calculate_breath_timing_features(
+    breaths_df: pd.DataFrame,
+    insp_duration_col: str = 'insp_duration_s',
+    exp_duration_col: str = 'exp_duration_s', # Added for I:E ratio
+    total_duration_col: str = 'total_duration_s', # Added for Resp Rate consistency check
+    window_breaths_baseline: int = 75 # Number of breaths for rolling baseline (e.g. ~2-5 mins)
+) -> pd.DataFrame:
+    """
+    Calculates breath timing features, including prolonged inspiration metrics,
+    and adds them as columns to the input breaths_df.
+
+    Args:
+        breaths_df (pd.DataFrame): DataFrame of detected breaths. Must contain
+                                   columns for inspiratory, expiratory, and total duration.
+        insp_duration_col (str): Name of the column with inspiratory durations.
+        exp_duration_col (str): Name of the column with expiratory durations.
+        total_duration_col (str): Name of the column with total breath durations.
+        window_breaths_baseline (int): Number of preceding breaths to use for the
+                                       rolling median baseline calculation of durations.
+
+    Returns:
+        pd.DataFrame: The input breaths_df with added columns:
+            - 'insp_duration_baseline': Rolling median of inspiratory duration.
+            - 'prolonged_insp_ratio': Ratio of current insp_duration to its baseline.
+            - 'ie_ratio': Inspiratory to expiratory time ratio.
+            - 'respiratory_rate_bpm': Calculated breaths per minute from total_duration.
+    """
+    if breaths_df.empty or not all(col in breaths_df.columns for col in [insp_duration_col, exp_duration_col, total_duration_col]):
+        # Return original df with empty columns if essential input is missing
+        for col in ['insp_duration_baseline', 'prolonged_insp_ratio', 'ie_ratio', 'respiratory_rate_bpm']:
+            if col not in breaths_df.columns: # Avoid re-adding if called multiple times
+                 breaths_df[col] = np.nan
+        return breaths_df
+
+    df = breaths_df.copy() # Work on a copy
+
+    # Rolling baseline for inspiratory duration
+    # Using median for robustness to outliers (e.g., a single very long sigh)
+    # min_periods can be set to a fraction of the window to get values at the beginning
+    min_periods_baseline = window_breaths_baseline // 3
+    df['insp_duration_baseline'] = df[insp_duration_col].rolling(
+        window=window_breaths_baseline,
+        min_periods=min_periods_baseline,
+        center=False # Use past breaths for baseline
+    ).median()
+    # Fill NaNs at the beginning (due to rolling window) with global median or overall mean of first N breaths
+    initial_baseline_fill = df[insp_duration_col].head(window_breaths_baseline).median()
+    if pd.isna(initial_baseline_fill): # if still NaN (e.g. very few breaths)
+        initial_baseline_fill = df[insp_duration_col].median() # Use global median
+    df['insp_duration_baseline'].fillna(initial_baseline_fill, inplace=True)
+
+
+    # Prolonged inspiration ratio
+    # Avoid division by zero if baseline is somehow zero (though unlikely for duration)
+    df['prolonged_insp_ratio'] = df[insp_duration_col] / df['insp_duration_baseline'].replace(0, np.nan)
+    df['prolonged_insp_ratio'].fillna(1.0, inplace=True) # If baseline was 0 or NaN, assume ratio is 1 (no change)
+
+    # I:E Ratio
+    # Avoid division by zero if expiratory duration is zero
+    df['ie_ratio'] = df[insp_duration_col] / df[exp_duration_col].replace(0, np.nan)
+    # For very short expirations, I:E can be very large. Consider capping or specific handling if needed.
+
+    # Respiratory Rate (breaths per minute)
+    # RR = 60 / total breath duration in seconds
+    df['respiratory_rate_bpm'] = 60.0 / df[total_duration_col].replace(0, np.nan)
+
+    return df
+
+
+def calculate_periodic_breathing_features(
+    breath_amplitudes: pd.Series,
+    min_duration_for_analysis_s: float = 60.0, # Minimum duration of breath data needed
+    pb_analysis_resample_fs_hz: float = 0.5, # Resample breath amplitudes to this freq (e.g., every 2s)
+    pb_low_freq_hz: float = 0.01,  # Lower bound for PB spectral band (100s cycle)
+    pb_high_freq_hz: float = 0.04, # Upper bound for PB spectral band (25s cycle)
+    welch_nperseg_factor: float = 4.0 # NPERSEG for Welch as factor of min cycle samples (1/PB_HIGH_FREQ * resample_fs)
+                                     # e.g., 1/0.04Hz = 25s. If resample_fs=0.5Hz, then 12.5 samples. Factor 4 -> NPERSEG ~50
+                                     # Or, more simply, fixed NPERSEG like 64 or 128 if resample_fs is fixed.
+                                     # Let's use a fixed NPERSEG based on resample_fs to ensure enough length.
+                                     # If resample_fs = 0.5Hz, NPERSEG=64 => 128s window for Welch.
+                                     # NPERSEG=128 => 256s window.
+) -> Dict[str, float]:
+    """
+    Calculates features indicative of periodic breathing from a series of breath amplitudes.
+
+    Args:
+        breath_amplitudes (pd.Series): Series of breath amplitude values (e.g., tidal volumes,
+                                       peak inspiratory flows), indexed by DatetimeIndex
+                                       corresponding to breath start times.
+        min_duration_for_analysis_s (float): Minimum total duration of the breath_amplitudes
+                                             segment required for reliable PB analysis.
+        pb_analysis_resample_fs_hz (float): Frequency to resample the breath amplitude
+                                            signal to before spectral analysis.
+        pb_low_freq_hz (float): Lower frequency bound for periodic breathing band.
+        pb_high_freq_hz (float): Upper frequency bound for periodic breathing band.
+        welch_nperseg_factor (float): Factor to determine nperseg for Welch's method.
+                                      (This argument is currently overridden by a fixed nperseg).
+
+    Returns:
+        Dict[str, float]: Dictionary with PB features:
+            - 'pb_abs_power': Absolute power in the PB frequency band.
+            - 'pb_rel_power': Relative power in the PB band (to total power up to 0.25Hz).
+            - 'pb_peak_freq': Dominant frequency in the PB band.
+            Returns NaNs if data is insufficient or PB not detected.
+    """
+    default_pb_features = {
+        'pb_abs_power': np.nan,
+        'pb_rel_power': np.nan,
+        'pb_peak_freq': np.nan
+    }
+
+    if breath_amplitudes.empty or len(breath_amplitudes) < 10: # Need at least a few breaths
+        return default_pb_features
+
+    segment_duration_s = (breath_amplitudes.index[-1] - breath_amplitudes.index[0]).total_seconds()
+    if segment_duration_s < min_duration_for_analysis_s:
+        return default_pb_features
+
+    # 1. Create a regular time grid and interpolate breath amplitudes
+    # Ensure breath_amplitudes index is DatetimeIndex
+    if not isinstance(breath_amplitudes.index, pd.DatetimeIndex):
+        # This case should ideally not happen if called from extract_features_for_event with breaths_df
+        print("Warning: breath_amplitudes for PB analysis does not have DatetimeIndex.")
+        return default_pb_features
+
+    # Convert DatetimeIndex to seconds from start for interpolation
+    time_in_seconds = (breath_amplitudes.index - breath_amplitudes.index[0]).total_seconds()
+    amplitudes = breath_amplitudes.values
+
+    # New regular time grid for resampling
+    num_resampled_points = int(segment_duration_s * pb_analysis_resample_fs_hz)
+    if num_resampled_points < 20: # Need enough points for spectral analysis after resampling
+        return default_pb_features
+
+    resampled_time_s = np.linspace(0, segment_duration_s, num_resampled_points)
+
+    try:
+        resampled_amplitudes = np.interp(resampled_time_s, time_in_seconds, amplitudes)
+    except Exception as e:
+        print(f"Error during PB amplitude interpolation: {e}")
+        return default_pb_features
+
+    # 2. Apply Welch's method
+    # NPERSEG should be chosen to resolve low frequencies.
+    # Max period = 1/pb_low_freq_hz (e.g., 100s). Min samples in NPERSEG to resolve this = fs / f_resolution.
+    # If fs = 0.5Hz, pb_low_freq_hz = 0.01Hz. One cycle = 100s = 50 samples at 0.5Hz.
+    # NPERSEG should ideally be >= number of samples in the longest period of interest.
+    # Let's use a fixed nperseg that is reasonable for common PB cycle lengths and typical analysis windows.
+    # E.g., if resampled at 0.5Hz, an nperseg of 64 covers 128s. nperseg of 128 covers 256s.
+    nperseg_welch = min(len(resampled_amplitudes), 128) # Cap at available data length or 128 points (256s window at 0.5Hz)
+    if nperseg_welch < 32 and len(resampled_amplitudes) >=32 : nperseg_welch = 32 # minimum reasonable nperseg
+    elif nperseg_welch < len(resampled_amplitudes) and nperseg_welch < 16: # If data is extremely short but > nperseg_min
+         return default_pb_features # Too short for reliable welch
+
+
+    if len(resampled_amplitudes) < nperseg_welch : # Data must be longer than segment length
+        # If data is shorter than desired nperseg, use all data for one segment if it's of minimal length
+        if len(resampled_amplitudes) >= 16: # some arbitrary minimum for a single FFT
+            nperseg_welch = len(resampled_amplitudes)
+        else:
+            return default_pb_features
+
+
+    freqs, psd = welch(resampled_amplitudes, fs=pb_analysis_resample_fs_hz,
+                       nperseg=nperseg_welch, noverlap=nperseg_welch // 2 if nperseg_welch >0 else 0)
+
+    # 3. Calculate power in PB band
+    pb_band_mask = (freqs >= pb_low_freq_hz) & (freqs <= pb_high_freq_hz)
+    if np.any(pb_band_mask):
+        pb_abs_power = np.trapz(psd[pb_band_mask], freqs[pb_band_mask])
+
+        # Dominant frequency in PB band
+        if pb_abs_power > 1e-9: # Only find peak if there's some power
+            peak_idx_in_band = np.argmax(psd[pb_band_mask])
+            pb_peak_freq = freqs[pb_band_mask][peak_idx_in_band]
+        else:
+            pb_peak_freq = np.nan
+            pb_abs_power = 0.0 # Ensure it's float if no power
+    else:
+        pb_abs_power = 0.0
+        pb_peak_freq = np.nan
+
+    # 4. Calculate relative power
+    # Total power up to a reasonable max respiratory modulation frequency (e.g., 0.25 Hz = 4s cycle)
+    total_power_band_mask = (freqs > 0) & (freqs <= 0.25) # Exclude DC (freqs > 0)
+    if np.any(total_power_band_mask):
+        total_power = np.trapz(psd[total_power_band_mask], freqs[total_power_band_mask])
+        if total_power > 1e-9: # Avoid division by zero / meaningless ratio
+            pb_rel_power = pb_abs_power / total_power
+        else:
+            pb_rel_power = np.nan if pb_abs_power > 0 else 0.0 # If total power is zero, rel power is 0 unless pb_abs_power was non-zero (error)
+    else:
+        pb_rel_power = np.nan
+
+    return {
+        'pb_abs_power': pb_abs_power,
+        'pb_rel_power': pb_rel_power,
+        'pb_peak_freq': pb_peak_freq
+    }
 
 
 if __name__ == '__main__':

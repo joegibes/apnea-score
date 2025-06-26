@@ -154,3 +154,153 @@ if __name__ == '__main__':
 from typing import Optional, Dict # Add these if not already present at top of feature_engineering.py
 # This is for the return type hint of calculate_flow_limitation_features
 # And for Optional type hint for device_flow_lim_segment
+
+from src.feature_engineering import calculate_breath_timing_features, calculate_periodic_breathing_features
+
+class TestBreathTimingFeatures(unittest.TestCase):
+    def setUp(self):
+        # Create a sample breaths_df
+        self.n_breaths = 150 # Enough for a rolling window
+        self.normal_insp_duration = 1.5 # seconds
+        self.normal_exp_duration = 2.0
+        self.normal_total_duration = self.normal_insp_duration + self.normal_exp_duration
+
+        insp_durations = np.full(self.n_breaths, self.normal_insp_duration)
+        exp_durations = np.full(self.n_breaths, self.normal_exp_duration)
+        total_durations = np.full(self.n_breaths, self.normal_total_duration)
+
+        # Introduce a period of prolonged inspirations
+        prolonged_start_idx = 100
+        prolonged_insp_duration = 2.5
+        insp_durations[prolonged_start_idx:] = prolonged_insp_duration
+        total_durations[prolonged_start_idx:] = prolonged_insp_duration + exp_durations[prolonged_start_idx:]
+
+        # Create timestamps assuming regular breath intervals for simplicity in test setup
+        # Note: real breath_start_time would be cumulative sum of total_durations
+        # This simplification is okay as calculate_breath_timing_features doesn't use the index for rolling window
+
+        self.breaths_data = {
+            'insp_duration_s': insp_durations,
+            'exp_duration_s': exp_durations,
+            'total_duration_s': total_durations,
+            # 'breath_start_time': pd.to_datetime(np.cumsum(np.concatenate(([0], total_durations[:-1]))), unit='s') # More realistic index
+        }
+        self.breaths_df = pd.DataFrame(self.breaths_data)
+        # Add a simple range index as the function itself does not use the DatetimeIndex for rolling window logic.
+        self.breaths_df.index = pd.RangeIndex(start=0, stop=len(self.breaths_df), step=1)
+
+
+    def test_calculate_breath_timing_features(self):
+        window_baseline = 50 # Use a smaller window for easier verification in test
+        processed_breaths_df = calculate_breath_timing_features(
+            self.breaths_df.copy(), window_breaths_baseline=window_baseline
+        )
+
+        self.assertIn('insp_duration_baseline', processed_breaths_df.columns)
+        self.assertIn('prolonged_insp_ratio', processed_breaths_df.columns)
+        self.assertIn('ie_ratio', processed_breaths_df.columns)
+        self.assertIn('respiratory_rate_bpm', processed_breaths_df.columns)
+
+        # Check baseline calculation
+        # Before prolonged period (e.g., index 50 to 99), baseline should be normal_insp_duration
+        self.assertTrue(np.allclose(
+            processed_breaths_df['insp_duration_baseline'].iloc[window_baseline:100],
+            self.normal_insp_duration,
+            atol=0.1
+        ))
+
+        # During prolonged period, baseline should gradually increase then stabilize
+        # At index 100 (start of prolonged), baseline is still from normal period
+        self.assertAlmostEqual(processed_breaths_df['insp_duration_baseline'].iloc[100], self.normal_insp_duration, delta=0.1)
+        # Much later in prolonged period (e.g. 100 + window_baseline), baseline should be prolonged_insp_duration
+        if len(processed_breaths_df) > 100 + window_baseline:
+             self.assertAlmostEqual(processed_breaths_df['insp_duration_baseline'].iloc[100 + window_baseline], 2.5, delta=0.1)
+
+
+        # Check prolonged_insp_ratio
+        # Before prolonged period, ratio should be ~1.0
+        self.assertTrue(np.allclose(
+            processed_breaths_df['prolonged_insp_ratio'].iloc[window_baseline:100],
+            1.0,
+            atol=0.1 # allow for slight variations if baseline isn't perfectly stable
+        ))
+        # At the start of prolonged period, ratio should be > 1
+        self.assertGreater(processed_breaths_df['prolonged_insp_ratio'].iloc[100], 1.5) # 2.5 / 1.5 ~ 1.66
+
+        # Check I:E ratio
+        expected_ie_ratio_normal = self.normal_insp_duration / self.normal_exp_duration
+        self.assertTrue(np.allclose(processed_breaths_df['ie_ratio'].iloc[:99], expected_ie_ratio_normal, atol=0.01))
+
+        # Check Respiratory Rate
+        expected_rr_normal = 60.0 / self.normal_total_duration
+        self.assertTrue(np.allclose(processed_breaths_df['respiratory_rate_bpm'].iloc[:99], expected_rr_normal, atol=0.1))
+
+    def test_timing_features_empty_df(self):
+        empty_df = pd.DataFrame(columns=['insp_duration_s', 'exp_duration_s', 'total_duration_s'])
+        processed_df = calculate_breath_timing_features(empty_df)
+        self.assertTrue(processed_df.empty or all(col in processed_df for col in ['insp_duration_baseline', 'prolonged_insp_ratio']))
+        if not processed_df.empty:
+            self.assertTrue(processed_df['insp_duration_baseline'].isna().all())
+
+
+class TestPeriodicBreathingFeatures(unittest.TestCase):
+    def setUp(self):
+        self.n_points_pb = 300 # Roughly 5 minutes of breaths if each is 1s
+        self.base_time_index = pd.to_datetime(np.arange(self.n_points_pb) * 4, unit='s') # Breaths every 4s avg
+
+    def test_calculate_pb_features_clear_periodicity(self):
+        # Simulate breath amplitudes with a 40s cycle (0.025 Hz)
+        cycle_duration_s = 40.0
+        pb_freq = 1.0 / cycle_duration_s # 0.025 Hz
+
+        # Create timestamps for breaths (unevenly sampled for realism, but avg 4s apart)
+        # Total duration for analysis ~ self.n_points_pb * 4s = 1200s
+        # This ensures min_duration_for_analysis_s (default 60s) is met
+
+        # Amplitudes: baseline + sine modulation
+        amplitudes = 1.0 + 0.5 * np.sin(2 * np.pi * pb_freq * (self.base_time_index - self.base_time_index[0]).total_seconds())
+        breath_amplitudes_series = pd.Series(amplitudes, index=self.base_time_index, name='tidal_volume_l')
+
+        pb_features = calculate_periodic_breathing_features(breath_amplitudes_series)
+
+        self.assertGreater(pb_features['pb_abs_power'], 0.01) # Expect some power
+        self.assertGreater(pb_features['pb_rel_power'], 0.1)  # Expect it to be a significant portion
+        self.assertAlmostEqual(pb_features['pb_peak_freq'], pb_freq, delta=0.005) # Check dominant freq
+
+    def test_calculate_pb_features_no_periodicity(self):
+        # Random breath amplitudes
+        amplitudes = 1.0 + 0.1 * np.random.randn(len(self.base_time_index))
+        breath_amplitudes_series = pd.Series(amplitudes, index=self.base_time_index, name='tidal_volume_l')
+
+        pb_features = calculate_periodic_breathing_features(breath_amplitudes_series)
+
+        # Expect low power in PB band for random data
+        self.assertLess(pb_features['pb_rel_power'], 0.1) # Relative power should be small
+        # Peak freq might be anything or NaN if power is too low
+        if pb_features['pb_abs_power'] < 1e-3 : # very low absolute power
+             self.assertTrue(pd.isna(pb_features['pb_peak_freq']) or pb_features['pb_abs_power'] < 1e-3)
+
+
+    def test_calculate_pb_features_insufficient_data(self):
+        short_time_index = pd.to_datetime(np.arange(10) * 4, unit='s') # Only 10 breaths, ~40s
+        amplitudes = 1.0 + 0.5 * np.sin(2 * np.pi * 0.025 * (short_time_index - short_time_index[0]).total_seconds())
+        breath_amplitudes_series = pd.Series(amplitudes, index=short_time_index)
+
+        pb_features = calculate_periodic_breathing_features(breath_amplitudes_series, min_duration_for_analysis_s=60)
+        self.assertTrue(pd.isna(pb_features['pb_abs_power']))
+        self.assertTrue(pd.isna(pb_features['pb_rel_power']))
+        self.assertTrue(pd.isna(pb_features['pb_peak_freq']))
+
+    def test_calculate_pb_features_empty_input(self):
+        empty_series = pd.Series([], dtype=float, index=pd.to_datetime([]))
+        pb_features = calculate_periodic_breathing_features(empty_series)
+        self.assertTrue(pd.isna(pb_features['pb_abs_power']))
+
+
+if __name__ == '__main__':
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)
+
+from typing import Optional, Dict # Add these if not already present at top of feature_engineering.py
+# This is for the return type hint of calculate_flow_limitation_features
+# And for Optional type hint for device_flow_lim_segment
+# Also for calculate_periodic_breathing_features
