@@ -1,11 +1,12 @@
 import pandas as pd
 import numpy as np
-from scipy.signal import find_peaks
+from typing import Optional
+from scipy.signal import find_peaks, butter, filtfilt
 
 def detect_breaths_from_flow(flow_series: pd.Series,
                              sampling_freq_hz: float,
                              peak_prominence_threshold: Optional[float] = None,
-                             zero_crossing_hysteresis: float = 0.01) -> pd.DataFrame:
+                             zero_crossing_hysteresis: float = 0.005) -> pd.DataFrame:
     """
     Detects individual breaths from a flow rate signal.
     This implementation primarily uses zero-crossings, but also identifies
@@ -43,59 +44,55 @@ def detect_breaths_from_flow(flow_series: pd.Series,
     if flow_series.empty:
         return pd.DataFrame() # Return empty if no data
 
+    # --- Step 1: Low-pass filter the flow signal to suppress noise ---
+    def butter_lowpass_filter(data, cutoff, fs, order=4):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        b, a = butter(order, normal_cutoff, btype='low', analog=False)
+        return filtfilt(b, a, data)
+
+    filtered_flow = pd.Series(
+        butter_lowpass_filter(flow_series.values, cutoff=4.0, fs=sampling_freq_hz, order=4),
+        index=flow_series.index
+    )
+
     # Default prominence if not provided: 10% of std of flow, or a minimum of 0.05
     if peak_prominence_threshold is None:
-        flow_std = flow_series.std()
+        flow_std = filtered_flow.std()
         peak_prominence_threshold = max(0.05, flow_std * 0.1) if flow_std > 0 else 0.05
 
     dt_seconds = 1.0 / sampling_freq_hz
 
-    # 1. Find zero-crossing points (inspiration to expiration, and vice-versa)
-    # Positive flow is inspiration, negative is expiration.
-    # Sign of flow: 1 for positive, -1 for negative, 0 for zero.
-    sign = np.sign(flow_series)
-
-    # Hysteresis: flow must cross +/- zero_crossing_hysteresis
-    above_hysteresis = flow_series > zero_crossing_hysteresis
-    below_hysteresis = flow_series < -zero_crossing_hysteresis
-
-    # Inspiration to expiration: was above hysteresis, now below (or near zero)
-    insp_to_exp_crossings_indices = np.where(above_hysteresis & ~above_hysteresis.shift(1, fill_value=False) & (sign.shift(1, fill_value=0) != -1))[0]
-    # Expiration to inspiration: was below hysteresis, now above (or near zero)
-    exp_to_insp_crossings_indices = np.where(below_hysteresis & ~below_hysteresis.shift(1, fill_value=False) & (sign.shift(1, fill_value=0) != 1))[0]
-
-    # Refine crossings: ensure they are actual zero-crossings or very close to it.
-    # This can be tricky if flow hovers near zero. The hysteresis helps.
-    # The current logic finds when it *stops* being above/below hysteresis.
-    # Let's ensure these are actual changes in dominant flow direction
-
-    # Simpler zero crossing: (sign changes, ignoring zeros)
-    # s_flow = flow_series[flow_series.abs() > zero_crossing_hysteresis] # ignore points too close to zero
-    # if s_flow.empty: return pd.DataFrame()
-    # zero_crossings = np.where(np.diff(np.sign(s_flow)) != 0)[0] + 1 # +1 to align with original series indices
-    # zero_crossing_times = s_flow.index[zero_crossings]
-
-    # Alternative and often more robust: use actual sign changes, then filter by hysteresis magnitude
-    # A crossing occurs when sign[i] != sign[i-1] AND sign[i-1] != 0
-    actual_sign_changes = np.where((sign != sign.shift(1)) & (sign.shift(1) != 0))[0]
-
-    # Filter these by ensuring the crossing involves passing the hysteresis band
+    # --- Step 2: Robust zero-crossing detection with larger hysteresis and sign change ---
+    sign = np.sign(filtered_flow)
     valid_crossings_indices = []
-    for idx in actual_sign_changes:
-        if idx == 0: continue # Cannot check previous for first point
-        # Insp to Exp: flow_series[idx-1] > hysteresis AND flow_series[idx] < hysteresis
-        if sign.iloc[idx-1] == 1 and sign.iloc[idx] == -1 and \
-           flow_series.iloc[idx-1] > zero_crossing_hysteresis and flow_series.iloc[idx] < -zero_crossing_hysteresis:
+    last_crossing_idx = -10
+    min_gap_samples = int(0.3 * sampling_freq_hz)  # 300ms minimum between crossings
+    for idx in range(1, len(filtered_flow)):
+        # Prevent double-counting: skip if too close to previous crossing
+        if idx - last_crossing_idx < min_gap_samples:
+            continue
+        # Exp to Insp: crosses from below -hysteresis to above +hysteresis
+        if filtered_flow.iloc[idx-1] < -zero_crossing_hysteresis and filtered_flow.iloc[idx] > zero_crossing_hysteresis:
             valid_crossings_indices.append(idx)
-        # Exp to Insp: flow_series[idx-1] < -hysteresis AND flow_series[idx] > hysteresis
-        elif sign.iloc[idx-1] == -1 and sign.iloc[idx] == 1 and \
-             flow_series.iloc[idx-1] < -zero_crossing_hysteresis and flow_series.iloc[idx] > zero_crossing_hysteresis:
+            last_crossing_idx = idx
+        # Insp to Exp: crosses from above +hysteresis to below -hysteresis
+        elif filtered_flow.iloc[idx-1] > zero_crossing_hysteresis and filtered_flow.iloc[idx] < -zero_crossing_hysteresis:
             valid_crossings_indices.append(idx)
-        # Or if one side is near zero but the other clearly crosses
-        elif sign.iloc[idx-1] == 1 and abs(flow_series.iloc[idx]) < zero_crossing_hysteresis and flow_series.iloc[idx-1] > zero_crossing_hysteresis: # Insp to near-zero
-             valid_crossings_indices.append(idx)
-        elif sign.iloc[idx-1] == -1 and abs(flow_series.iloc[idx]) < zero_crossing_hysteresis and flow_series.iloc[idx-1] < -zero_crossing_hysteresis: # Exp to near-zero
-             valid_crossings_indices.append(idx)
+            last_crossing_idx = idx
+
+    # --- Step 3: Remove implausible breaths based on duration ---
+    if not valid_crossings_indices:
+        return pd.DataFrame()
+
+    min_breath_samples = int(0.5 * sampling_freq_hz)
+    max_breath_samples = int(10.0 * sampling_freq_hz)
+    filtered_crossings = [valid_crossings_indices[0]]
+    for idx in valid_crossings_indices[1:]:
+        gap = idx - filtered_crossings[-1]
+        if min_breath_samples <= gap <= max_breath_samples:
+            filtered_crossings.append(idx)
+    valid_crossings_indices = filtered_crossings
 
 
     if not valid_crossings_indices:
@@ -455,4 +452,3 @@ if __name__ == '__main__':
     print("Correctly handled positive-only flow series.")
 
     print("\nBreath detection module tests complete.")
-from typing import Optional # Add this import
