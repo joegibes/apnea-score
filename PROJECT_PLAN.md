@@ -17,7 +17,7 @@ The Parekh et al. paper uses five signals: airflow, thoracic effort, abdominal e
 - **Import:**
   - Use the `load_edf_data` function in `src/data_loader.py` to load EDF files into pandas DataFrames.
   - Only load the relevant BRP and PLD files for each session (ignore other file types).
-  - For BRP, extract the 'Flow.40ms' signal. For PLD, extract 'MaskPress.2s' and 'Press.2s'.
+  - For BRP, extract the 'Flow.40ms' signal. For PLD, extract 'MaskPress.2s', 'Press.2s', 'EprPress.2s', 'Leak.2s', 'RespRate.2s', 'MinVent.2s', and 'FlowLim.2s'.
 - **Processing:**
   - Clean PLD data by removing checksum columns (columns containing 'Crc').
   - Merge BRP and PLD DataFrames on their timestamp index using an outer join, then forward-fill and drop any remaining NaNs.
@@ -25,6 +25,22 @@ The Parekh et al. paper uses five signals: airflow, thoracic effort, abdominal e
 - **Storage:**
   - Store merged session DataFrames in a standardized format (e.g., Parquet or HDF5) for efficient future access and analysis.
   - Only retain the columns/signals of interest to minimize storage and processing overhead.
+
+## Workflow for Efficient Feature Extraction (2025-06-26)
+
+1. **User Input:** User selects/uploads the BRP and PLD EDF files for a single night/session.
+2. **Efficient Data Processing:**
+   - Load and merge the required signals (see above) using optimized, vectorized pandas/numpy operations.
+   - Store the merged DataFrame in an efficient format (Parquet/HDF5) for downstream analysis.
+3. **Fast Breath Separation:**
+   - Run a highly efficient breath separation algorithm (optimized for speed and memory usage) on the Flow.40ms signal.
+   - The algorithm should be faster than the current notebook implementation, suitable for 5-8 hours of 25Hz data.
+4. **Feature Extraction:**
+   - Extract features for each breath, using Flow.40ms as the main signal, but leveraging additional signals (e.g., FlowLim.2s, MinVent.2s) for advanced features like flow limitation and periodic/cyclic breathing.
+
+## Efficiency Requirements
+- All algorithms must be highly efficient and scalable to handle high-frequency (25Hz), long-duration (5-8 hour) data.
+- Use vectorized operations and avoid unnecessary data copies or slow Python loops wherever possible.
 
 Our strategy is to overcome this limitation by:
 1.  **Implementing Directly Possible Features:** We will implement the features from the paper that can be derived from airflow and SpO2.
