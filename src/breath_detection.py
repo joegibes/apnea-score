@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from typing import Optional
 from scipy.signal import find_peaks
 
 def detect_breaths_from_flow(flow_series: pd.Series,
@@ -455,4 +456,3 @@ if __name__ == '__main__':
     print("Correctly handled positive-only flow series.")
 
     print("\nBreath detection module tests complete.")
-from typing import Optional # Add this import
